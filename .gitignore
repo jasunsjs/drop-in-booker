@@ -3,3 +3,7 @@
 
 # environment
 .env*
+
+# config
+dropin.config.json
+dropin-events.json
