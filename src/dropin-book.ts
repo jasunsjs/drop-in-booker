@@ -1,15 +1,16 @@
 import { chromium } from "playwright";
 import "dotenv/config";
-import type { Page } from "playwright";
+import type { Page, Locator } from "playwright";
 import dropinConfig from "../dropin.config.json" with { type: "json" };
 import events from "../dropin-events.json" with { type: "json" };
 
 const CONFIG = {
     baseUrl: "https://townofoakville.perfectmind.com/",
     loggedInUrl: /\/MyProfile\/Contact(?:\/|$)/,
-    timeout: 8000, // MS
+    timeout: 8000,
     headless: false,
-    refreshInterval: 2000 // MS
+    refreshInterval: 2000,
+    registerWaitTimeout: 10 * 60 * 1000, // 10 mins
 };
 
 const PROFILE = {
@@ -49,9 +50,9 @@ function to12Hour(time24: string): string {
         const hour12 = hour % 12 === 0 ? 12 : hour % 12;
 
         return `${hour12}:${m} ${suffix}`;
-    } else {
-        throw new Error(`Invalid time format: ${time24}`);
     }
+
+    throw new Error(`Invalid time format: ${time24}`);
 }
 
 function getTargetDate(eventConfig: EventConfig): Date {
@@ -60,18 +61,112 @@ function getTargetDate(eventConfig: EventConfig): Date {
     const todayDOW = today.getDay();
     const targetDOW = DOW_INDEX[eventConfig.day]!;
     let diff = targetDOW - todayDOW;
-    if (diff < 0) 
+    if (diff < 0) {
         diff += 7; // Calculate number of days ahead 
+    }
 
-    if (diff == 1 && !dropinConfig["book-for-tmr"]) 
+    if (diff == 1 && !dropinConfig["book-for-tmr"]) {
         diff += 7;
+    }
 
     target.setDate(target.getDate() + diff);
     return target;
 }
 
+async function displayRefreshTimer(page: Page, text: string) {
+  await page.evaluate((content) => {
+    const id = "register-refresh-timer";
+    let el = document.getElementById(id) as HTMLDivElement | null;
+
+    if (!el) {
+      el = document.createElement("div");
+      el.id = id;
+
+      // Position: centered at top, "hanging" down a bit
+      el.style.position = "fixed";
+      el.style.top = "20px";
+      el.style.left = "50%";
+      el.style.transform = "translateX(-50%)";
+
+      // Size & layout
+      el.style.padding = "12px 24px";
+      el.style.borderRadius = "999px"; // pill shape
+      el.style.maxWidth = "80%";
+      el.style.textAlign = "center";
+
+      // Visual style
+      el.style.background = "rgba(0, 0, 0, 0.8)";
+      el.style.color = "white";
+      el.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+      el.style.fontSize = "18px";
+      el.style.fontWeight = "600";
+      el.style.boxShadow = "0 4px 12px rgba(0, 0, 0, 0.4)";
+      el.style.zIndex = "999999";
+
+      // Don't block clicks on the page
+      el.style.pointerEvents = "none";
+
+      document.body.appendChild(el);
+    }
+
+    el.textContent = content;
+  }, text);
+}
+
+
+
+async function findTargetRow(allRows: Locator, targetDateHeader: string, eventConfig: EventConfig): Promise<Locator> {
+    const numRows = await allRows.count();
+    let targetDateIndex = -1;
+    for (let i = 0; i < numRows; i++) {
+        const row = allRows.nth(i);
+        const element = (await row.getAttribute("class"))!;
+        if (!element.includes("bm-marker-row")) continue; // Actual event elemnt, not date element
+        
+        const headerText = (await row.innerText()).trim();
+        if (headerText.startsWith(targetDateHeader)) {
+            console.log(`Located actual date header text: ${headerText}`);
+            targetDateIndex = i;
+            break;
+        }
+    }
+
+    if (targetDateIndex == -1) {
+        throw new Error ("No date row found for the target date");
+    }
+    
+    const time12 = to12Hour(eventConfig.time);
+    console.log(`Target time: ${time12}`);
+    let targetEventRow: Locator | null = null;
+
+    for (let i = targetDateIndex + 1; i < numRows; i++) {
+        const row = allRows.nth(i);
+        const element = (await row.getAttribute("class"))!;
+        if (!element.includes("bm-class-row")) break; // Date element, not actual event element
+        
+        const infoText = await row.innerText();
+        const timeLabel = await row.locator('span[aria-label^="Event time"]').innerText();
+
+        if (infoText.includes(eventConfig.sport) && infoText.includes(eventConfig.location) && timeLabel.startsWith(time12)) {
+            if (infoText.includes("Full")) {
+                throw new Error("Target event is full");
+            }
+
+            targetEventRow = row;
+            console.log("Event found");
+            break;
+        }
+    }
+
+    if (!targetEventRow) {
+        throw new Error("No event found");
+    }
+
+    return targetEventRow;
+}
+
 async function login(page: Page) {
-    console.log("Login");
+    console.log("Logging in...");
 
     await page.locator('#username').fill(PROFILE.username);
     await page.locator('#password').fill(PROFILE.password);
@@ -97,14 +192,15 @@ async function login(page: Page) {
     throw new Error("Login attempt timed out");
 }
 
-async function register(page: Page, eventConfig: EventConfig) {
-    console.log("Register");
+async function locateEvent(page: Page, eventConfig: EventConfig) {
+    console.log("Locating event...");
     if (!eventConfig) {
         throw new Error("Invalid drop-in event");
     }
     console.log(eventConfig);
     
-    page.locator('#load-more').click();
+    await page.locator('#load-more').click();
+    await page.locator('#bm-overlay').waitFor({ state: 'hidden' });
 
     const targetDate = getTargetDate(eventConfig);
     const weekdayHeader = targetDate.toLocaleDateString("en-US", { weekday: "short"});
@@ -112,11 +208,46 @@ async function register(page: Page, eventConfig: EventConfig) {
     const targetDateHeader = `${weekdayHeader}, ${monthHeader} ${targetDate.getDate()}`;
     console.log(`Target Date Header: ${targetDateHeader}`);
 
+    const allRows = page.locator("#classes tr");
+    const targetEventRow = await findTargetRow(allRows, targetDateHeader, eventConfig);
+    await targetEventRow.getByRole("button").click();
+}
 
+async function register(page: Page) {
+    console.log("Registering...");
 
+    const deadline = Date.now() + CONFIG.registerWaitTimeout;
+    const registerButton = page.locator('#bookEventButton');
 
-    const rows = page.locator('#classes tr.bm-class-row');
+    while (Date.now() < deadline) {
+        const waitingToRegister = page
+            .locator('.registration-info-header')
+            .filter({ hasText: "Registration Dates" })
+            .waitFor({ state: "visible" })
+            .then(() => "waiting" as const);
 
+        const registrationOpened = registerButton
+            .waitFor({ state: "visible" })
+            .then(() => "opened" as const);
+
+        const result = await Promise.race([waitingToRegister, registrationOpened]);
+
+        if (result == "opened") {
+            console.log("Registration open");
+            await registerButton.click();
+            return;
+        } else if (result == "waiting") {
+            const totalSeconds = Math.floor(CONFIG.refreshInterval / 1000);
+            for (let sec = totalSeconds; sec > 0; sec--) {
+                await displayRefreshTimer(page, `Refreshing in ${sec}s...`);
+                await page.waitForTimeout(1000);
+            }
+
+            await page.reload({ waitUntil: "domcontentloaded" });
+        }
+    }
+
+    throw new Error(`Register button did not appear within ${Math.floor(CONFIG.registerWaitTimeout / 1000)} seconds`);
 }
 
 async function main() {
@@ -128,7 +259,6 @@ async function main() {
     
     const browser = await chromium.launch({ headless: false });
     const page = await browser.newPage();
-
     await page.goto(CONFIG.baseUrl, { waitUntil: "domcontentloaded" });
 
     await login(page);
@@ -147,7 +277,8 @@ async function main() {
     const selectionList = page.locator('ul[data-bind*="foreach: calendars"]');
     await selectionList.getByText('Sports Drop-in').click();
 
-    await register(page, eventConfig);
+    await locateEvent(page, eventConfig);
+    await register(page);
 }
 
 if (!PROFILE.username || !PROFILE.password) {
