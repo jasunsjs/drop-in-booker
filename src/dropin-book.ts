@@ -9,13 +9,13 @@ const CONFIG = {
     loggedInUrl: /\/MyProfile\/Contact(?:\/|$)/,
     timeout: 8000,
     headless: false,
-    refreshInterval: 2000,
+    refreshInterval: 3000,
     registerWaitTimeout: 10 * 60 * 1000, // 10 mins
 };
 
 const PROFILE = {
-    username: process.env[`${dropinConfig.name.toUpperCase()}_USERNAME`]!,
-    password: process.env[`${dropinConfig.name.toUpperCase()}_PASSWORD`]!,
+    username: process.env[`${dropinConfig.name.replace(/\s+/g, "_").toUpperCase()}_USERNAME`]!,
+    password: process.env[`${dropinConfig.name.replace(/\s+/g, "_").toUpperCase()}_PASSWORD`]!,
 }
 
 const DOW_INDEX: Record<string, number> = {
@@ -113,8 +113,6 @@ async function displayRefreshTimer(page: Page, text: string) {
   }, text);
 }
 
-
-
 async function findTargetRow(allRows: Locator, targetDateHeader: string, eventConfig: EventConfig): Promise<Locator> {
     const numRows = await allRows.count();
     let targetDateIndex = -1;
@@ -187,7 +185,10 @@ async function login(page: Page) {
     await page.getByRole('button', { name: /sign in/i }).click();
     const result = await Promise.race([error, success, timeout]);
 
-    if (result == "success") return;
+    if (result == "success") {
+        console.log("Log in successful");
+        return;
+    }
 
     throw new Error("Login attempt timed out");
 }
@@ -210,41 +211,64 @@ async function locateEvent(page: Page, eventConfig: EventConfig) {
 
     const allRows = page.locator("#classes tr");
     const targetEventRow = await findTargetRow(allRows, targetDateHeader, eventConfig);
+    
     await targetEventRow.getByRole("button").click();
 }
 
-async function register(page: Page) {
+async function completePayment(page: Page) {
+    page.locator('#event-participants tr')
+
+    const targetAttendeeRow = page
+        .locator("#event-participants tr.bm-selectable-row")
+        .filter({ hasText: dropinConfig.name });
+    const checkbox = targetAttendeeRow.getByRole("checkbox");
+    await checkbox.check();
+    await page.getByRole("link", { name: "Next" }).click();
+
+    await page.locator("table.bm-extras-prices").waitFor({ state: "visible" });
+    const rows = page.locator("table.bm-extras-prices tr.radio-item");
+    const freeRows = rows.filter({ hasText: "Free" });
+    if (await freeRows.count()) {
+        console.log("Membership found");
+        await freeRows.first().getByRole("radio").check();
+    } else {
+        console.log("Payment required");
+        rows.first().getByRole("radio").check();
+    }
+    await page.getByRole("link", { name: "Next" }).click();
+
+    const checkoutFrame = page.frameLocator("iframe.online-store");
+    const placeOrderButton = checkoutFrame.getByRole("button", { name: /place my order/i });
+    await page.waitForTimeout(10000);
+    await placeOrderButton.click();
+
+    const confirmationText = page.getByText(/thank you/i);
+    await confirmationText.waitFor({ state: "visible" });
+    console.log("Payment successful");
+}
+
+async function register(page: Page, eventConfig: EventConfig) {
+    await locateEvent(page, eventConfig);
+    await page.locator(".event-info-column").waitFor({ state: "visible" });
     console.log("Registering...");
 
     const deadline = Date.now() + CONFIG.registerWaitTimeout;
     const registerButton = page.locator('#bookEventButton');
-
+    const totalSeconds = Math.floor(CONFIG.refreshInterval / 1000);
     while (Date.now() < deadline) {
-        const waitingToRegister = page
-            .locator('.registration-info-header')
-            .filter({ hasText: "Registration Dates" })
-            .waitFor({ state: "visible" })
-            .then(() => "waiting" as const);
+        for (let sec = totalSeconds; sec > 0; sec--) {
+            if (await registerButton.isVisible()) {
+                console.log("Registration open");
 
-        const registrationOpened = registerButton
-            .waitFor({ state: "visible" })
-            .then(() => "opened" as const);
-
-        const result = await Promise.race([waitingToRegister, registrationOpened]);
-
-        if (result == "opened") {
-            console.log("Registration open");
-            await registerButton.click();
-            return;
-        } else if (result == "waiting") {
-            const totalSeconds = Math.floor(CONFIG.refreshInterval / 1000);
-            for (let sec = totalSeconds; sec > 0; sec--) {
-                await displayRefreshTimer(page, `Refreshing in ${sec}s...`);
-                await page.waitForTimeout(1000);
+                await registerButton.click();
+                await completePayment(page);
+                return;
             }
 
-            await page.reload({ waitUntil: "domcontentloaded" });
+            await displayRefreshTimer(page, `Refreshing in ${sec}s...`);
+            await page.waitForTimeout(1000);
         }
+        await page.reload({ waitUntil: "domcontentloaded" });
     }
 
     throw new Error(`Register button did not appear within ${Math.floor(CONFIG.registerWaitTimeout / 1000)} seconds`);
@@ -277,8 +301,7 @@ async function main() {
     const selectionList = page.locator('ul[data-bind*="foreach: calendars"]');
     await selectionList.getByText('Sports Drop-in').click();
 
-    await locateEvent(page, eventConfig);
-    await register(page);
+    await register(page, eventConfig);
 }
 
 if (!PROFILE.username || !PROFILE.password) {
