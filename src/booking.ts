@@ -1,117 +1,6 @@
-import { chromium } from "playwright";
-import "dotenv/config";
 import type { Page, Locator } from "playwright";
-import dropinConfig from "../dropin.config.json" with { type: "json" };
-import events from "../dropin-events.json" with { type: "json" };
-
-const CONFIG = {
-    baseUrl: "https://townofoakville.perfectmind.com/",
-    loggedInUrl: /\/MyProfile\/Contact(?:\/|$)/,
-    timeout: 8000,
-    headless: false,
-    refreshInterval: 3000,
-    registerWaitTimeout: 10 * 60 * 1000, // 10 mins
-};
-
-const PROFILE = {
-    username: process.env[`${dropinConfig.name.replace(/\s+/g, "_").toUpperCase()}_USERNAME`]!,
-    password: process.env[`${dropinConfig.name.replace(/\s+/g, "_").toUpperCase()}_PASSWORD`]!,
-}
-
-const DOW_INDEX: Record<string, number> = {
-    Sunday: 0,
-    Monday: 1,
-    Tuesday: 2,
-    Wednesday: 3,
-    Thursday: 4,
-    Friday: 5,
-    Saturday: 6,
-} as const;
-
-type EventConfig = {
-    name: string;
-    sport: string;
-    location: string;
-    day: string; // Day of the week
-    time: string; // "HH:MM" 24h
-};
-
-type DropinConfig = {
-    name: string;
-    "event-name": string;
-    "book-for-tmr": boolean;
-};
-
-function to12Hour(time24: string): string {
-    const [hStr, m] = time24.split(':');
-    if (hStr && m) {
-        const hour = parseInt(hStr, 10);
-        const suffix = hour >= 12 ? "pm" : "am";
-        const hour12 = hour % 12 === 0 ? 12 : hour % 12;
-
-        return `${hour12}:${m} ${suffix}`;
-    }
-
-    throw new Error(`Invalid time format: ${time24}`);
-}
-
-function getTargetDate(eventConfig: EventConfig): Date {
-    const today = new Date();
-    const target = new Date(today);
-    const todayDOW = today.getDay();
-    const targetDOW = DOW_INDEX[eventConfig.day]!;
-    let diff = targetDOW - todayDOW;
-    if (diff < 0) {
-        diff += 7; // Calculate number of days ahead 
-    }
-
-    if (diff == 1 && !dropinConfig["book-for-tmr"]) {
-        diff += 7;
-    }
-
-    target.setDate(target.getDate() + diff);
-    return target;
-}
-
-async function displayRefreshTimer(page: Page, text: string) {
-  await page.evaluate((content) => {
-    const id = "register-refresh-timer";
-    let el = document.getElementById(id) as HTMLDivElement | null;
-
-    if (!el) {
-      el = document.createElement("div");
-      el.id = id;
-
-      // Position: centered at top, "hanging" down a bit
-      el.style.position = "fixed";
-      el.style.top = "20px";
-      el.style.left = "50%";
-      el.style.transform = "translateX(-50%)";
-
-      // Size & layout
-      el.style.padding = "12px 24px";
-      el.style.borderRadius = "999px"; // pill shape
-      el.style.maxWidth = "80%";
-      el.style.textAlign = "center";
-
-      // Visual style
-      el.style.background = "rgba(0, 0, 0, 0.8)";
-      el.style.color = "white";
-      el.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-      el.style.fontSize = "18px";
-      el.style.fontWeight = "600";
-      el.style.boxShadow = "0 4px 12px rgba(0, 0, 0, 0.4)";
-      el.style.zIndex = "999999";
-
-      // Don't block clicks on the page
-      el.style.pointerEvents = "none";
-
-      document.body.appendChild(el);
-    }
-
-    el.textContent = content;
-  }, text);
-}
+import { CONFIG, PROFILE, dropinConfig, type EventConfig } from "./config.js";
+import { to12Hour, getTargetDate, displayRefreshTimer } from "./utils.js";
 
 async function findTargetRow(allRows: Locator, targetDateHeader: string, eventConfig: EventConfig): Promise<Locator> {
     const numRows = await allRows.count();
@@ -163,7 +52,7 @@ async function findTargetRow(allRows: Locator, targetDateHeader: string, eventCo
     return targetEventRow;
 }
 
-async function login(page: Page) {
+export async function login(page: Page) {
     console.log("Logging in...");
 
     await page.locator('#username').fill(PROFILE.username);
@@ -193,7 +82,7 @@ async function login(page: Page) {
     throw new Error("Login attempt timed out");
 }
 
-async function locateEvent(page: Page, eventConfig: EventConfig) {
+export async function locateEvent(page: Page, eventConfig: EventConfig) {
     console.log("Locating event...");
     if (!eventConfig) {
         throw new Error("Invalid drop-in event");
@@ -215,7 +104,7 @@ async function locateEvent(page: Page, eventConfig: EventConfig) {
     await targetEventRow.getByRole("button").click();
 }
 
-async function completePayment(page: Page) {
+export async function completePayment(page: Page) {
     page.locator('#event-participants tr')
 
     const targetAttendeeRow = page
@@ -247,7 +136,7 @@ async function completePayment(page: Page) {
     console.log("Payment successful");
 }
 
-async function register(page: Page, eventConfig: EventConfig) {
+export async function register(page: Page, eventConfig: EventConfig) {
     await locateEvent(page, eventConfig);
     await page.locator(".event-info-column").waitFor({ state: "visible" });
     console.log("Registering...");
@@ -273,44 +162,3 @@ async function register(page: Page, eventConfig: EventConfig) {
 
     throw new Error(`Register button did not appear within ${Math.floor(CONFIG.registerWaitTimeout / 1000)} seconds`);
 }
-
-async function main() {
-    console.log("Start");
-
-    const eventName = dropinConfig["event-name"];
-    const eventConfig = events.find(e => e.name == eventName);
-    if (!eventConfig) throw new Error("Invalid drop-in event");
-    
-    const browser = await chromium.launch({ headless: false });
-    const page = await browser.newPage();
-    await page.goto(CONFIG.baseUrl, { waitUntil: "domcontentloaded" });
-
-    await login(page);
-    
-    const dropIn = page.getByRole('link', { name: "Drop-In Programs" });
-
-    if (await dropIn.isVisible()) {
-        await dropIn.click();
-    } else {
-        const moreMenu = page.getByRole('menuitem', { name: "More" });
-        await moreMenu.hover();
-        await dropIn.waitFor({ state: 'visible' });
-        await dropIn.click();
-    }
-
-    const selectionList = page.locator('ul[data-bind*="foreach: calendars"]');
-    await selectionList.getByText('Sports Drop-in').click();
-
-    await register(page, eventConfig);
-}
-
-if (!PROFILE.username || !PROFILE.password) {
-    throw new Error("Invalid environment variables username or password");
-}
-
-try {
-    await main();
-} catch (e) {
-    console.error("Error: ", e);
-}
-
